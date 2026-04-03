@@ -1,114 +1,129 @@
 #include <iostream>
-#include <algorithm>
 #include <vector>
 #include <random>
 #include <chrono>
 #include <cstdint>
+#include <cmath>
 #include <cassert>
+#include <fstream>
+#include <string>
 
+#include <sycl/sycl.hpp>
 #include "medianFilter.h"
 #include "medianFilterSIMD.h"
 #include "medianFilterGPU.h"
 
-namespace {
+constexpr size_t width = 4096;
+constexpr size_t height = 4096;
+constexpr size_t stride = width;
+constexpr float salt_pepper_probability = 0.10f;
 
-constexpr size_t image_width = 4096*4;
-constexpr size_t image_height = 4096*4;
-constexpr size_t image_stride = image_width;
 
-std::vector<uint8_t> generate_test_image(size_t width, size_t height, size_t stride) {
-    std::vector<uint8_t> image(height * stride, 0);
+static void write_matrix_to_file(const std::string& filename,
+                                 const std::vector<uint8_t>& data,
+                                 size_t width,
+                                 size_t height,
+                                 size_t stride,
+                                 const std::string& title) {
+    std::ofstream file(filename, std::ios::app);
+    if (!file) {
+        std::cerr << "Cannot open file: " << filename << '\n';
+        return;
+    }
 
-    std::mt19937 gen(42);
-    std::uniform_int_distribution<int> noise(-12, 12);
+    file << title << "\n";
+    file << "size = " << width << " x " << height << "\n";
 
     for (size_t y = 0; y < height; ++y) {
         for (size_t x = 0; x < width; ++x) {
-            const int base = static_cast<int>((x * 3 + y * 5) % 256);
-            int value = base + noise(gen);
+            file << static_cast<int>(data[y * stride + x]);
+            if (x + 1 < width) file << ' ';
+        }
+        file << '\n';
+    }
 
-            if (((x + y) % 29) == 0) value += 80;
-            if (((x * 2 + y) % 31) == 0) value -= 80;
+    file << "\n----------------------------------------\n\n";
+}
 
+static std::vector<uint8_t> generate_test_image(size_t w, size_t h, size_t s, float impulse_prob) {
+    std::vector<uint8_t> img(h * s, 0);
+
+    std::mt19937 gen(42);
+    std::uniform_real_distribution<float> p(0.0f, 1.0f);
+    std::uniform_int_distribution<int> impulse01(0, 1);
+
+    for (size_t y = 0; y < h; ++y) {
+        for (size_t x = 0; x < w; ++x) {
+            float base = 127.5f
+                + 60.0f * std::sin(0.013f * static_cast<float>(x))
+                + 45.0f * std::cos(0.017f * static_cast<float>(y));
+
+            int value = static_cast<int>(std::lround(base));
             value = std::max(0, std::min(255, value));
-            image[y * stride + x] = static_cast<uint8_t>(value);
+
+            if (p(gen) < impulse_prob) {
+                value = impulse01(gen) ? 255 : 0;
+            }
+
+            img[y * s + x] = static_cast<uint8_t>(value);
         }
     }
 
-    return image;
+    return img;
 }
 
-bool compare_images(const uint8_t* lhs, const uint8_t* rhs, size_t width, size_t height, size_t stride) {
-    for (size_t y = 0; y < height; ++y) {
-        for (size_t x = 0; x < width; ++x) {
-            if (lhs[y * stride + x] != rhs[y * stride + x]) return false;
+static bool compare_images(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i] != b[i]) {
+            std::cerr << "Mismatch at index " << i
+                      << ": " << static_cast<int>(a[i])
+                      << " != " << static_cast<int>(b[i]) << '\n';
+            return false;
         }
     }
     return true;
 }
 
-template<typename Func>
-long long measure_ms(Func&& func) {
-    const auto start = std::chrono::high_resolution_clock::now();
-    func();
-    const auto end = std::chrono::high_resolution_clock::now();
-    return std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-}
-
-} // namespace
-
 int main() {
-    std::cout << "2D median filter benchmark 3x3\n";
-    std::cout << "Image: " << image_width << " x " << image_height << "\n";
+    std::cout << "Benchmark: 2D median filter 3x3\n";
+    std::cout << "Image size: " << width << " x " << height << '\n';
 
-    auto source_image = generate_test_image(image_width, image_height, image_stride);
+    std::ofstream("gpu_matrices.txt", std::ios::trunc).close();
+    auto original = generate_test_image(width, height, stride, salt_pepper_probability);
+    write_matrix_to_file("gpu_matrices.txt", original, width, height, stride, "Initial matrix");
 
-    std::vector<uint8_t> single_thread(image_height * image_stride);
-    std::vector<uint8_t> simd(image_height * image_stride);
-    std::vector<uint8_t> gpu(image_height * image_stride);
+    std::vector<uint8_t> out_cpu(height * stride);
+    std::vector<uint8_t> out_simd(height * stride);
+    std::vector<uint8_t> out_gpu(height * stride);
 
-    const auto single_time = measure_ms([&] {
-        MedianFilter::median_filter_3x3(
-            source_image.data(),
-            single_thread.data(),
-            image_width,
-            image_height,
-            image_stride
-        );
-    });
-    std::cout << "Single thread: " << single_time << " ms\n";
+    auto start1 = std::chrono::high_resolution_clock::now();
+    MedianFilter::median_filter_3x3(original.data(), out_cpu.data(), width, height, stride);
+    auto end1 = std::chrono::high_resolution_clock::now();
+    auto duration1 = std::chrono::duration_cast<std::chrono::milliseconds>(end1 - start1);
+    std::cout << "Single thread version: " << duration1.count() << " ms\n";
 
-    const auto simd_time = measure_ms([&] {
-        MedianFilterSIMD::median_filter_3x3(
-            source_image.data(),
-            simd.data(),
-            image_width,
-            image_height,
-            image_stride
-        );
-    });
-    std::cout << "SIMD: " << simd_time << " ms\n";
+    auto start2 = std::chrono::high_resolution_clock::now();
+    MedianFilterSIMD::median_filter_3x3(original.data(), out_simd.data(), width, height, stride);
+    auto end2 = std::chrono::high_resolution_clock::now();
+    auto duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(end2 - start2);
+    std::cout << "SIMD version:          " << duration2.count() << " ms\n";
 
-    assert(compare_images(single_thread.data(), simd.data(), image_width, image_height, image_stride));
-    std::cout << "CPU == SIMD: OK\n";
+    // Прогрев GPU, чтобы в замер не попадали JIT/инициализация устройства
+    std::vector<uint8_t> warmup(height * stride);
+    MedianFilterGPU::median_filter_3x3(original.data(), warmup.data(), width, height, stride);
 
-    if (!MedianFilterGPU::has_gpu()) {
-        std::cout << "GPU device not found. GPU benchmark skipped.\n";
-        return 0;
-    }
+    auto start3 = std::chrono::high_resolution_clock::now();
+    MedianFilterGPU::median_filter_3x3(original.data(), out_gpu.data(), width, height, stride);
+    auto end3 = std::chrono::high_resolution_clock::now();
+    auto duration3 = std::chrono::duration_cast<std::chrono::milliseconds>(end3 - start3);
+    std::cout << "GPU version:           " << duration3.count() << " ms\n";
+    write_matrix_to_file("gpu_matrices.txt", out_gpu, width, height, stride, "Final matrix after GPU median filter");
+    
 
-    const auto gpu_time = measure_ms([&] {
-        MedianFilterGPU::median_filter_3x3(
-            source_image.data(),
-            gpu.data(),
-            image_width,
-            image_height,
-            image_stride
-        );
-    });
-    std::cout << "GPU: " << gpu_time << " ms\n";
+    assert(compare_images(out_cpu, out_simd));
+    assert(compare_images(out_cpu, out_gpu));
+    std::cout << "Results are equal!\n";
 
-    assert(compare_images(single_thread.data(), gpu.data(), image_width, image_height, image_stride));
-    std::cout << "CPU == GPU: OK\n";
     return 0;
 }
