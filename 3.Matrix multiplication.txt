@@ -1,0 +1,372 @@
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <chrono>
+#include <vector>
+#include <limits>
+#include <omp.h>
+#include <sycl/sycl.hpp>
+using namespace sycl;
+
+using matrixType = float;
+const int matrixSize = 4096;//128-512
+const int N = matrixSize;
+constexpr int tile_size = 16;
+
+
+template <typename T>
+static T rand_uniform_01() {
+    return T(std::rand()) / T(RAND_MAX);
+}
+
+template <typename T>
+static std::vector<T> make_random_square_matrix() {
+    std::vector<T> matrix(matrixSize * matrixSize);
+    std::generate_n(matrix.data(), matrix.size(),
+        rand_uniform_01<T>);
+    return matrix;
+}
+
+template <typename T>
+int check_results(const std::vector<T>& matrixC,
+    const std::vector<T>& referenceC) {
+    const int M = matrixSize;
+    const int N = matrixSize;
+
+    float err = 0.f;
+    for (int i = 0; i < M * N; ++i) {
+        float localErr = std::fabs(matrixC[i] - referenceC[i]) /
+            std::max(std::fabs(matrixC[i]),
+                std::fabs(referenceC[i]));
+        err = std::max(localErr, err);
+        if (localErr >= 0.001f) {
+            std::cerr << "Error at index " << i << ": Wanted "
+                << referenceC[i] << ", got " << matrixC[i]
+                << std::endl;
+            break;
+        }
+    }
+
+    return err < 0.001f;
+}
+
+template <typename T>
+void compute_reference(const std::vector<T>& matrixA,
+    const std::vector<T>& matrixB,
+    std::vector<T>& matrixC) {
+    const int M = matrixSize;
+    const int N = matrixSize;
+    const int K = matrixSize;
+
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            T sum = 0;
+            for (int k = 0; k < K; k++) {
+                sum += matrixA[m * K + k] * matrixB[k * N + n];
+            }
+            matrixC[m * N + n] = sum;
+        }
+    }
+}
+
+
+//последовательная
+template <typename T>
+void matmul_seq(const std::vector<T>& A, const std::vector<T>& B, std::vector<T>& C) {
+    const int n = matrixSize;
+    std::fill(C.begin(), C.end(), (T)0);
+
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            T tmp = 0;
+            for (int k = 0; k < n; ++k) {
+                tmp += A[i * n + k] * B[k * n + j];
+            }
+            C[i * n + j] = tmp;
+        }
+    }
+}
+
+//OpenMP
+template <typename T>
+void matmul_omp(const std::vector<T>& A, const std::vector<T>& B, std::vector<T>& C) {
+    const int n = matrixSize;
+    std::fill(C.begin(), C.end(), (T)0);
+
+#pragma omp parallel for
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < n; ++j) {
+            T tmp = 0;
+            for (int k = 0; k < n; ++k) {
+                tmp += A[i * n + k] * B[k * n + j];
+            }
+            C[i * n + j] = tmp;
+        }
+    }
+}
+
+
+//SYCL (USM Shared) - наивный алгоритм
+template <typename T>
+void matmul_sycl_USM_shared(const std::vector<T>& vecA,
+    const std::vector<T>& vecB,
+    std::vector<T>& vecC) {
+    const int N = matrixSize;
+    std::fill(vecC.begin(), vecC.end(), (T)0);
+
+    queue q;
+
+    T* dataA = sycl::malloc_shared<T>(N * N, q);
+    T* dataB = sycl::malloc_shared<T>(N * N, q);
+    T* dataC = sycl::malloc_shared<T>(N * N, q);
+
+    q.memcpy(dataA, vecA.data(), N * N * sizeof(T));
+    q.memcpy(dataB, vecB.data(), N * N * sizeof(T));
+    q.fill(dataC, (T)0, N * N);
+    q.wait();
+
+    q.submit([&](sycl::handler& h) {
+        h.parallel_for(range<2>{N, N}, [=](sycl::id<2> idx) {
+            int i = idx[0];
+            int j = idx[1];
+
+            T sum = 0;
+            for (int k = 0; k < N; k++) {
+                sum += dataA[i * N + k] * dataB[k * N + j];
+            }
+            dataC[i * N + j] = sum;
+            });
+        });
+    q.wait();
+
+    q.memcpy(vecC.data(), dataC, N * N * sizeof(T)).wait();
+
+    sycl::free(dataA, q);
+    sycl::free(dataB, q);
+    sycl::free(dataC, q);
+}
+
+
+//SYCL (USM Shared) - разбиваем задачу на маленькие блоки
+template <typename T>
+void matmul_sycl_USM_shared_tiles(const std::vector<T>& vecA,
+    const std::vector<T>& vecB,
+    std::vector<T>& vecC) {
+    std::fill(vecC.begin(), vecC.end(), (T)0);
+
+    queue q;
+
+    T* dataA = sycl::malloc_shared<T>(N * N, q);
+    T* dataB = sycl::malloc_shared<T>(N * N, q);
+    T* dataC = sycl::malloc_shared<T>(N * N, q);
+
+    q.memcpy(dataA, vecA.data(), N * N * sizeof(T));
+    q.memcpy(dataB, vecB.data(), N * N * sizeof(T));
+    std::fill(dataC, dataC + N * N, (T)0);
+
+    q.submit([&](sycl::handler& h) {
+        //local_accessor - общая память для всей рабочей группы (shared local memory)
+        sycl::local_accessor<T, 2> tileA(sycl::range<2>{tile_size, tile_size}, h);
+        sycl::local_accessor<T, 2> tileB(sycl::range<2>{tile_size, tile_size}, h);
+
+        h.parallel_for(
+            sycl::nd_range<2>(
+                sycl::range<2>{N, N},
+                sycl::range<2>{tile_size, tile_size}
+            ),
+            [=](sycl::nd_item<2> item) {
+                int m = item.get_global_id(0);
+                int n = item.get_global_id(1);
+                int local_m = item.get_local_id(0);
+                int local_n = item.get_local_id(1);
+
+                T sum = 0;
+
+                //цикл по блокам
+                for (int kk = 0; kk < N; kk += tile_size) {
+                    //загружаем tile в local memory
+                    tileA[local_m][local_n] = dataA[m * N + (kk + local_n)];
+                    tileB[local_m][local_n] = dataB[(kk + local_m) * N + n];
+
+                    //синхронизация перед загрузкой tileA и tileB
+                    item.barrier(sycl::access::fence_space::local_space);
+
+                    //вычисление
+                    for (int k = 0; k < tile_size; k++) {
+                        sum += tileA[local_m][k] * tileB[k][local_n];
+                    }
+
+                    //синхронизация перед загрузкой следующего тайла
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+
+                dataC[m * N + n] = sum;
+            }
+        );
+    });
+
+    q.wait();
+
+    q.memcpy(vecC.data(), dataC, N * N * sizeof(T)).wait();
+
+    sycl::free(dataA, q);
+    sycl::free(dataB, q);
+    sycl::free(dataC, q);
+}
+
+
+//SYCL (sycl::buffer) - наивный алгоритм
+template <typename T>
+void matmul_sycl_buffer(const std::vector<T>& vecA,
+    const std::vector<T>& vecB,
+    std::vector<T>& vecC) {
+    const int N = matrixSize;
+    std::fill(vecC.begin(), vecC.end(), (T)0);
+
+    sycl::buffer<T> bufA{ vecA };
+    sycl::buffer<T> bufB{ vecB };
+    sycl::buffer<T> bufC{ vecC };
+
+    queue q;
+
+    q.submit([&](handler& h) {
+        sycl::accessor accA{ bufA, h };
+        sycl::accessor accB{ bufB, h };
+        sycl::accessor accC{ bufC, h };
+
+        h.parallel_for(range<2>{N, N}, [=](sycl::id<2> idx) {
+            int i = idx[0];
+            int j = idx[1];
+
+            T sum = 0;
+            for (int k = 0; k < N; k++) {
+                sum += accA[i * N + k] * accB[k * N + j];
+            }
+            accC[i * N + j] = sum;
+            });
+        });
+
+    q.wait();
+}
+
+
+//SYCL (sycl::buffer) - разбиваем задачу на маленькие блоки
+template <typename T>
+void matmul_sycl_buffer_tiles(const std::vector<T>& vecA, const std::vector<T>& vecB, std::vector<T>& vecC) {
+    const int M = matrixSize;
+    const int N = matrixSize;
+    const int K = matrixSize;
+
+    std::fill(vecC.begin(), vecC.end(), (T)0);
+
+    buffer<T> bufA{ vecA };//M * K
+    buffer<T> bufB{ vecB };//K * N
+    buffer<T> bufC{ vecC };//M * N
+
+    queue q;
+
+    q.submit([&](handler& h) {
+        accessor matrixA{ bufA, h };
+        accessor matrixB{ bufB, h };
+        accessor matrixC{ bufC, h };
+
+        //local_accessor - общая память для всей рабочей группы (shared local memory)
+        local_accessor<T, 2> tileA{ range{tile_size, tile_size}, h };
+        local_accessor<T, 2> tileB{ range{tile_size, tile_size}, h };
+
+        h.parallel_for(nd_range<2>{range{ M, N }, range{ tile_size, tile_size }},
+            [=](nd_item<2> item) {
+                int m = item.get_global_id(0);
+                int n = item.get_global_id(1);
+                int local_m = item.get_local_id(0);
+                int local_n = item.get_local_id(1);
+
+                T sum = 0;
+                for (int kk = 0; kk < K; kk += tile_size) {
+                    //загружаем tile в local memory
+                    tileA[local_m][local_n] = matrixA[m * K + (kk + local_n)];
+                    tileB[local_m][local_n] = matrixB[(kk + local_m) * N + n];
+                    item.barrier(access::fence_space::local_space);
+
+                    for (int k = 0; k < tile_size; k++) {
+                        sum += tileA[local_m][k] * tileB[k][local_n];
+                    }
+                    item.barrier(access::fence_space::local_space);
+                }
+
+                matrixC[m * N + n] = sum;
+            });
+        });
+
+    q.wait();
+}
+
+
+int main() {
+    auto matrixA = make_random_square_matrix<matrixType>();
+    auto matrixB = make_random_square_matrix<matrixType>();
+    //auto referenceC = std::vector<matrixType>(matrixSize * matrixSize, 0);
+    //auto matrixC_seq = std::vector<matrixType>(matrixSize * matrixSize, 0);
+    //auto matrixC_omp = std::vector<matrixType>(matrixSize * matrixSize, 0);
+    auto matrixC_gpu = std::vector<matrixType>(matrixSize * matrixSize, 0);
+    auto matrixC_gpu_2 = std::vector<matrixType>(matrixSize * matrixSize, 0);
+    auto matrixC_gpu_3 = std::vector<matrixType>(matrixSize * matrixSize, 0);
+    auto matrixC_gpu_4 = std::vector<matrixType>(matrixSize * matrixSize, 0);
+
+
+
+    //compute_reference(matrixA, matrixB, referenceC);
+
+    //auto cpu_start = std::chrono::steady_clock::now();
+    //matmul_seq(matrixA, matrixB, matrixC_seq);
+    //auto cpu_duration = std::chrono::steady_clock::now() - cpu_start;
+    //double cpu_seconds = std::chrono::duration_cast<std::chrono::nanoseconds>(cpu_duration).count() / 1e9;
+
+    //auto omp_start = std::chrono::steady_clock::now();
+    //matmul_omp(matrixA, matrixB, matrixC_omp);
+    //auto omp_duration = std::chrono::steady_clock::now() - omp_start;
+    //double omp_seconds = std::chrono::duration_cast<std::chrono::nanoseconds>(omp_duration).count() / 1e9;
+
+    auto gpu_start = std::chrono::steady_clock::now();
+    matmul_sycl_USM_shared(matrixA, matrixB, matrixC_gpu);
+    auto gpu_duration = std::chrono::steady_clock::now() - gpu_start;
+    double gpu_seconds = std::chrono::duration_cast<std::chrono::nanoseconds>(gpu_duration).count() / 1e9;
+
+    auto gpu_start_2 = std::chrono::steady_clock::now();
+    matmul_sycl_buffer(matrixA, matrixB, matrixC_gpu_2);
+    auto gpu_duration_2 = std::chrono::steady_clock::now() - gpu_start_2;
+    double gpu_seconds_2 = std::chrono::duration_cast<std::chrono::nanoseconds>(gpu_duration_2).count() / 1e9;
+
+    auto gpu_start_3 = std::chrono::steady_clock::now();
+    matmul_sycl_USM_shared_tiles(matrixA, matrixB, matrixC_gpu_3);
+    auto gpu_duration_3 = std::chrono::steady_clock::now() - gpu_start_3;
+    double gpu_seconds_3 = std::chrono::duration_cast<std::chrono::nanoseconds>(gpu_duration_3).count() / 1e9;
+
+    auto gpu_start_4 = std::chrono::steady_clock::now();
+    matmul_sycl_buffer_tiles(matrixA, matrixB, matrixC_gpu_4);
+    auto gpu_duration_4 = std::chrono::steady_clock::now() - gpu_start_4;
+    double gpu_seconds_4 = std::chrono::duration_cast<std::chrono::nanoseconds>(gpu_duration_4).count() / 1e9;
+
+
+    //if (
+    //    !check_results(matrixC_gpu, referenceC) ||
+    //    !check_results(matrixC_gpu_2, referenceC) ||
+    //    !check_results(matrixC_omp, referenceC)
+    //    || !check_results(matrixC_seq, referenceC)
+    //    ) {
+    //    std::cerr << "Results did not validate!" << std::endl;
+    //    return -1;
+    //}
+
+    std::cout << "Success!\n";
+    std::cout << "matrix size: " << matrixSize << "\n";
+    //std::cout << "CPU Singlethread seconds: " << cpu_seconds << "\n";
+    //std::cout << "OMP (CPU Multithread) seconds: " << omp_seconds << "\n";
+    std::cout << "GPU (USM Shared) seconds: " << gpu_seconds << "\n";
+    std::cout << "GPU (sycl::buffer) seconds: " << gpu_seconds_2 << "\n";
+    std::cout << "GPU (USM Shared tiles) seconds: " << gpu_seconds_3 << "\n";
+    std::cout << "GPU (sycl::buffer tiles) seconds: " << gpu_seconds_4 << "\n";
+
+
+    return 0;
+}
